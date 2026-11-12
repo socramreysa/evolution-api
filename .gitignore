@@ -35,6 +35,11 @@ lerna-debug.log*
 /instances/*
 !/instances/.gitkeep
 /test/
+!/test/
+/test/*
+!/test/chatwoot.service.lid-group.test.ts
+!/test/whatsapp.baileys.reconnect.test.ts
+!/test/tsconfig.json
 /src/env.yml
 /store
 *.env
@@ -46,3 +51,5 @@ lerna-debug.log*
 .tool-versions
 
 /prisma/migrations/*
+# Local Pi runtime state
+.atl/
