@@ -1,3 +1,4 @@
+import { RequestHistoryOnDemandDto } from '@api/dto/chat.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ProxyDto } from '@api/dto/proxy.dto';
 import { SettingsDto } from '@api/dto/settings.dto';
@@ -684,6 +685,62 @@ export class ChannelStartupService {
         records: messages,
       },
     };
+  }
+
+  public async requestHistoryOnDemand(data: RequestHistoryOnDemandDto) {
+    const count = data.count ?? 50;
+
+    const anchor = await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: this.instanceId,
+        AND: [{ key: { path: ['id'], equals: data.messageId } }],
+      },
+      select: {
+        key: true,
+        messageTimestamp: true,
+      },
+    });
+
+    let anchorKey: { id: string; remoteJid: string; fromMe: boolean };
+    let timestampSeconds: number;
+
+    if (anchor) {
+      anchorKey = anchor.key as { id: string; remoteJid: string; fromMe: boolean };
+      timestampSeconds = anchor.messageTimestamp;
+    } else if (data.remoteJid && data.timestampSeconds) {
+      // This endpoint is admin-apikey gated. The connected instance can only request
+      // history for its own WhatsApp account (server-scoped), so an anchor key built
+      // from caller-supplied fields cannot cross accounts.
+      anchorKey = {
+        id: data.messageId,
+        remoteJid: data.remoteJid,
+        fromMe: data.fromMe ?? false,
+      };
+      timestampSeconds = data.timestampSeconds;
+    } else {
+      throw new NotFoundException('Anchor message not found for on-demand history');
+    }
+
+    let requestId: string;
+    try {
+      requestId = await this.client.fetchMessageHistory(
+        count,
+        anchorKey,
+        // messageTimestamp is stored in seconds but baileys expects milliseconds:
+        // messages-recv.js writes oldestMsgTimestampMs unchanged (baileys #2452 / PR #2616).
+        timestampSeconds * 1000,
+      );
+    } catch {
+      throw {
+        status: 409,
+        error: 'Conflict',
+        message: 'Instance is not connected or not authenticated for on-demand history',
+      };
+    }
+
+    this.logger.info(`requestHistoryOnDemand accepted count=${count} requestId=${requestId}`);
+
+    return { status: 'accepted', requestId };
   }
 
   public async fetchStatusMessage(query: any) {

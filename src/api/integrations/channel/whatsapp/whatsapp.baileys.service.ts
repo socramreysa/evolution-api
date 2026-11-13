@@ -275,6 +275,10 @@ export class BaileysStartupService extends ChannelStartupService {
   private historySyncChatCount = 0;
   private historySyncContactCount = 0;
   private historySyncLastProgress = -1;
+  // History-sync accounting for envelopes that must never be persisted silently:
+  // recognized non-message control envelopes vs. potentially-visible unsupported content.
+  private historySyncSkippedControlCount = 0;
+  private historySyncUnsupportedCount = 0;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -1088,6 +1092,8 @@ export class BaileysStartupService extends ChannelStartupService {
           this.historySyncMessageCount = 0;
           this.historySyncChatCount = 0;
           this.historySyncContactCount = 0;
+          this.historySyncSkippedControlCount = 0;
+          this.historySyncUnsupportedCount = 0;
         }
 
         this.historySyncLastProgress = normalizedProgress;
@@ -1210,6 +1216,9 @@ export class BaileysStartupService extends ChannelStartupService {
           chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
         }
 
+        let skippedControls = 0;
+        let unsupported = 0;
+
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
             continue;
@@ -1229,6 +1238,15 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
+          if (!getContentType(m.message)) {
+            if (this.isRecognizedControlEnvelope(m.message)) {
+              skippedControls += 1;
+            } else {
+              unsupported += 1;
+            }
+            continue;
+          }
+
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
             if (participantJid && contactsMap.has(participantJid)) {
@@ -1241,16 +1259,30 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
-        this.historySyncMessageCount += messagesRaw.length;
+        this.historySyncSkippedControlCount += skippedControls;
+        this.historySyncUnsupportedCount += unsupported;
+
+        if (skippedControls > 0) {
+          this.logger.warn(`history sync: skipped ${skippedControls} control envelope(s) without message content`);
+        }
+
+        if (unsupported > 0) {
+          this.logger.warn(
+            `history sync: skipped ${unsupported} unsupported message(s) without a recognized content type`,
+          );
+        }
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          const inserted = await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          this.logger.info(`history sync: ${inserted.count} message(s) inserted in this batch`);
         }
 
         this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
           isLatest,
           progress,
         });
+
+        this.historySyncMessageCount += messagesRaw.length;
 
         if (
           this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
@@ -1278,6 +1310,8 @@ export class BaileysStartupService extends ChannelStartupService {
           this.historySyncMessageCount = 0;
           this.historySyncChatCount = 0;
           this.historySyncContactCount = 0;
+          this.historySyncSkippedControlCount = 0;
+          this.historySyncUnsupportedCount = 0;
           this.historySyncLastProgress = -1;
         }
 
@@ -5220,6 +5254,30 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return obj;
+  }
+
+  /**
+   * Classifies history-sync envelopes that must never reach `prepareMessage`.
+   *
+   * The pinned Baileys `getContentType` deliberately returns `undefined` both for
+   * genuinely empty content and for the `senderKeyDistributionMessage` control
+   * envelope (it is a security key-distribution signal, never user-visible message
+   * content). Everything else that lacks a recognized content type (e.g. `call`,
+   * `chat`, `messageContextInfo`) is potentially-visible data that this layer does
+   * not yet know how to preserve; those are surfaced as unsupported rather than
+   * silently discarded.
+   */
+  private isRecognizedControlEnvelope(content: unknown): boolean {
+    if (!content || typeof content !== 'object') {
+      return true;
+    }
+
+    const keys = Object.keys(content);
+    if (keys.length === 0) {
+      return true;
+    }
+
+    return keys.every((key) => key === 'senderKeyDistributionMessage');
   }
 
   private prepareMessage(message: WAMessage): Message {

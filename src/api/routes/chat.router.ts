@@ -13,6 +13,7 @@ import {
   ProfilePictureDto,
   ProfileStatusDto,
   ReadMessageDto,
+  RequestHistoryOnDemandDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -38,6 +39,7 @@ import {
   profileSchema,
   profileStatusSchema,
   readMessageSchema,
+  requestHistoryOnDemandSchema,
   updateMessageSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
@@ -184,6 +186,16 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('requestHistoryOnDemand'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<RequestHistoryOnDemandDto>({
+          request: req,
+          schema: requestHistoryOnDemandSchema,
+          ClassRef: RequestHistoryOnDemandDto,
+          execute: (instance, data) => chatController.requestHistoryOnDemand(instance, data),
+        });
+
+        return res.status(202).json(response);
       })
       .post(this.routerPath('findStatusMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<Query<MessageUpdate>>({

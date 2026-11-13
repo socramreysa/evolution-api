@@ -12,6 +12,7 @@ import {
   ProfilePictureDto,
   ProfileStatusDto,
   ReadMessageDto,
+  RequestHistoryOnDemandDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -66,6 +67,10 @@ export class ChatController {
 
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
     return await this.waMonitor.waInstances[instanceName].fetchMessages(query);
+  }
+
+  public async requestHistoryOnDemand({ instanceName }: InstanceDto, data: RequestHistoryOnDemandDto) {
+    return await this.waMonitor.waInstances[instanceName].requestHistoryOnDemand(data);
   }
 
   public async fetchStatusMessage({ instanceName }: InstanceDto, query: Query<MessageUpdate>) {

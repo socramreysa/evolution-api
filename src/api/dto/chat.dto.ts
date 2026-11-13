@@ -140,3 +140,11 @@ export class DecryptPollVoteDto {
   };
   remoteJid: string;
 }
+
+export class RequestHistoryOnDemandDto {
+  messageId: string;
+  count?: number;
+  remoteJid?: string;
+  fromMe?: boolean;
+  timestampSeconds?: number;
+}
