@@ -53,3 +53,21 @@ export const requestHistoryOnDemandSchema: JSONSchema7 = {
     timestampSeconds: ['remoteJid'],
   },
 };
+
+export const resolveLidMappingsSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    lids: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 100,
+      items: {
+        type: 'string',
+        pattern: '^\\d+@lid$',
+      },
+      description: '"lids" must list between 1 and 100 LID JIDs',
+    },
+  },
+  required: ['lids'],
+};

@@ -13,6 +13,7 @@ import {
   ProfileStatusDto,
   ReadMessageDto,
   RequestHistoryOnDemandDto,
+  ResolveLidMappingsDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -71,6 +72,10 @@ export class ChatController {
 
   public async requestHistoryOnDemand({ instanceName }: InstanceDto, data: RequestHistoryOnDemandDto) {
     return await this.waMonitor.waInstances[instanceName].requestHistoryOnDemand(data);
+  }
+
+  public async resolveLidMappings({ instanceName }: InstanceDto, data: ResolveLidMappingsDto) {
+    return await this.waMonitor.waInstances[instanceName].resolveLidMappings(data);
   }
 
   public async fetchStatusMessage({ instanceName }: InstanceDto, query: Query<MessageUpdate>) {

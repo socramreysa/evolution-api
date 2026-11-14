@@ -1,4 +1,4 @@
-import { RequestHistoryOnDemandDto } from '@api/dto/chat.dto';
+import { RequestHistoryOnDemandDto, ResolveLidMappingsDto } from '@api/dto/chat.dto';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ProxyDto } from '@api/dto/proxy.dto';
 import { SettingsDto } from '@api/dto/settings.dto';
@@ -741,6 +741,45 @@ export class ChannelStartupService {
     this.logger.info(`requestHistoryOnDemand accepted count=${count} requestId=${requestId}`);
 
     return { status: 'accepted', requestId };
+  }
+
+  public async resolveLidMappings(data: ResolveLidMappingsDto) {
+    const lids = data.lids;
+
+    const lidMapping = this.client?.signalRepository?.lidMapping;
+    if (!lidMapping) {
+      throw {
+        status: 409,
+        error: 'Conflict',
+        message: 'Instance is not connected or not authenticated for LID resolution',
+      };
+    }
+
+    const mappings: { lid: string; pn: string }[] = [];
+    const unresolved: string[] = [];
+
+    try {
+      for (const lid of lids) {
+        const pn = await lidMapping.getPNForLID(lid);
+
+        if (pn) {
+          mappings.push({ lid, pn });
+        } else {
+          unresolved.push(lid);
+        }
+      }
+    } catch {
+      throw {
+        status: 409,
+        error: 'Conflict',
+        message: 'Instance is not connected or not authenticated for LID resolution',
+      };
+    }
+
+    this.logger.info(`resolveLidMappings count=${lids.length} resolved=${mappings.length}`);
+
+    // Unknown LIDs are normal: report them without failing the whole batch.
+    return unresolved.length > 0 ? { mappings, unresolved: { lids: unresolved } } : { mappings };
   }
 
   public async fetchStatusMessage(query: any) {

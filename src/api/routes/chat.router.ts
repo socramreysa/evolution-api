@@ -14,6 +14,7 @@ import {
   ProfileStatusDto,
   ReadMessageDto,
   RequestHistoryOnDemandDto,
+  ResolveLidMappingsDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -40,6 +41,7 @@ import {
   profileStatusSchema,
   readMessageSchema,
   requestHistoryOnDemandSchema,
+  resolveLidMappingsSchema,
   updateMessageSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
@@ -196,6 +198,16 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(202).json(response);
+      })
+      .post(this.routerPath('resolveLidMappings'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<ResolveLidMappingsDto>({
+          request: req,
+          schema: resolveLidMappingsSchema,
+          ClassRef: ResolveLidMappingsDto,
+          execute: (instance, data) => chatController.resolveLidMappings(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
       })
       .post(this.routerPath('findStatusMessage'), ...guards, async (req, res) => {
         const response = await this.dataValidate<Query<MessageUpdate>>({

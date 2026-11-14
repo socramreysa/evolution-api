@@ -148,3 +148,7 @@ export class RequestHistoryOnDemandDto {
   fromMe?: boolean;
   timestampSeconds?: number;
 }
+
+export class ResolveLidMappingsDto {
+  lids: string[];
+}
