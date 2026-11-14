@@ -381,7 +381,21 @@ export class InstanceController {
 
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
-        return await this.connectToWhatsapp({ instanceName });
+
+        // The cached connection status still reports the pre-restart state, so the
+        // controller-level connectToWhatsapp would early-return on 'open' and leave the
+        // closed socket unrecovered. Reconnect at the service level instead.
+        await instance.connectToWhatsapp();
+
+        // Wait a bit for the reconnection to change the reported state.
+        await delay(2000);
+
+        return {
+          instance: {
+            instanceName: instanceName,
+            status: instance.connectionStatus?.state || 'connecting',
+          },
+        };
       }
 
       return {

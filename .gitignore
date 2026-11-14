@@ -41,6 +41,7 @@ lerna-debug.log*
 !/test/whatsapp.baileys.reconnect.test.ts
 !/test/whatsapp.baileys.history-set.test.ts
 !/test/chat.request-history.test.ts
+!/test/instance.controller.restart.test.ts
 !/test/tsconfig.json
 /src/env.yml
 /store
