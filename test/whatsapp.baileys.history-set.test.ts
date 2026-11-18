@@ -26,6 +26,7 @@ const configuration = {
   PROXY: {},
   SERVER: { URL: 'https://offline.invalid' },
   AUTHENTICATION: { EXPOSE_IN_FETCH_INSTANCES: false },
+  TELEMETRY: { ENABLED: false },
 };
 class OfflineConfig {
   get(key: string) {
@@ -69,7 +70,7 @@ const emittedEvents: Emitted[] = [];
 mock.module('@api/server.module', {
   namedExports: {
     waMonitor: { waInstances: {} },
-    chatbotController: {},
+    chatbotController: { emit: async () => undefined },
     eventManager: {
       emit: async (payload: { event: string; data: any }) => {
         emittedEvents.push({ event: payload.event, data: payload.data });
@@ -79,6 +80,19 @@ mock.module('@api/server.module', {
 });
 
 let deliver: (events: object) => void;
+// DISCLOSED SYNTHETIC FIXTURE: simulates a Baileys build whose `getContentType`
+// yields no key for a multi-key envelope (`{albumMessage, messageContextInfo}`),
+// which is what leaves `messageType` undefined and drops the album row. Off by
+// default: the pinned rc.9 SDK DOES resolve `albumMessage` for that envelope, so
+// real-SDK behaviour is asserted separately and this fixture only covers the
+// resolution-failure branch the production failure requires.
+let simulateMultiKeyContentTypeUndefined = false;
+let realBaileys: any;
+let getRealContentType: (content: any) => any = () => undefined;
+const getContentTypeUnderTest = (content: any) =>
+  simulateMultiKeyContentTypeUndefined && content && typeof content === 'object' && Object.keys(content).length > 1
+    ? undefined
+    : getRealContentType(content);
 const makeSocket = () => ({
   user: { id: '15551234567@s.whatsapp.net', name: 'Offline' },
   profilePictureUrl: async () => null,
@@ -94,13 +108,14 @@ const makeSocket = () => ({
 
 let BaileysStartupService: any;
 before(async () => {
-  const realBaileys = await import('baileys');
+  realBaileys = await import('baileys');
+  getRealContentType = (content: any) => realBaileys.getContentType(content);
   mock.module('baileys', {
     cache: true,
     defaultExport: { __esModule: true, default: makeSocket },
     namedExports: {
       proto: realBaileys.proto,
-      getContentType: realBaileys.getContentType,
+      getContentType: getContentTypeUnderTest,
       getDevice: realBaileys.getDevice,
       isJidGroup: realBaileys.isJidGroup,
       isJidNewsletter: realBaileys.isJidNewsletter,
@@ -132,6 +147,7 @@ async function setup(options: { existingMessageIds?: string[] } = {}) {
   createManyCalls.length = 0;
   createManyKeyIds.clear();
   failNextCreateMany = false;
+  simulateMultiKeyContentTypeUndefined = false;
 
   const instanceName = `offline-history-${Math.random().toString(36).slice(2)}`;
   const instanceId = `${instanceName}-id`;
@@ -143,7 +159,12 @@ async function setup(options: { existingMessageIds?: string[] } = {}) {
     proxy: { findUnique: async () => ({ enabled: false }) },
     instance: { update: async () => ({}) },
     session: { findFirst: async () => null },
-    chat: { findMany: async () => [], createMany: async () => ({ count: 0 }) },
+    contact: { findFirst: async () => null },
+    chat: {
+      findFirst: async () => null,
+      findMany: async () => [],
+      createMany: async () => ({ count: 0 }),
+    },
     message: {
       findMany: async () => (options.existingMessageIds ?? []).map((id) => ({ key: { id } })),
       createMany: async ({ data }: { data: any[] }) => {
@@ -230,6 +251,22 @@ const callMessage = () => ({
   message: { call: { callKey: 'x' } },
   messageTimestamp: 1700000003,
 });
+const textMessage = (id: string) => ({
+  key: { id, remoteJid: jid, fromMe: false },
+  message: { conversation: `hello ${id}` },
+  messageTimestamp: 1700000004,
+});
+// WhatsApp album container: a multi-key envelope (`albumMessage` metadata plus
+// `messageContextInfo`). It is not user-visible media by itself; it is the row
+// that carries the album placeholder ([Álbum]) into Chatwoot.
+const albumContainer = (id: string, expectedImageCount = 2) => ({
+  key: { id, remoteJid: jid, fromMe: false },
+  message: {
+    albumMessage: { expectedImageCount, expectedVideoCount: 0 },
+    messageContextInfo: { deviceListMetadata: {}, deviceListMetadataVersion: 2 },
+  },
+  messageTimestamp: 1700000005,
+});
 
 const messagesSetEvents = () => emittedEvents.filter((e) => e.event === 'messages.set');
 const historySetEvents = () => emittedEvents.filter((e) => e.event === 'messaging-history.set');
@@ -306,6 +343,106 @@ test('persistence rejection is logged and never counts toward a later completion
   assert.equal(createManyCalls.length, 1, String(errors));
   assert.equal(historySetEvents().length, 1);
   assert.equal(historySetEvents()[0].data.messageCount, 1);
+});
+
+test('album container is persisted with its own message type instead of skipped as unsupported', async () => {
+  await setup();
+  deliver(historyEvent([albumContainer('M5'), textMessage('M6')], 100));
+  await flush();
+
+  assert.equal(createManyCalls.length, 1, String(errors));
+  const inserted = createManyCalls[0].data;
+  assert.deepEqual(
+    inserted.map((record) => [record.key.id, record.messageType]),
+    [
+      ['M5', 'albumMessage'],
+      ['M6', 'conversation'],
+    ],
+  );
+  assert.ok(
+    !warns.some((w) => w.includes('unsupported')),
+    `album container must not be classified unsupported: ${String(warns)}`,
+  );
+  assert.equal(historySetEvents()[0].data.messageCount, 2);
+});
+
+test('album container is recognised as content, never as control envelope', async () => {
+  await setup();
+  deliver(historyEvent([albumContainer('M7')], 100));
+  await flush();
+
+  assert.equal(createManyCalls[0].data.length, 1, String(errors));
+  assert.equal(createManyCalls[0].data[0].messageType, 'albumMessage');
+  assert.ok(
+    !warns.some((w) => w.includes('control')),
+    `album container must not be classified control: ${String(warns)}`,
+  );
+});
+
+test('live upsert of an album container carries its own message type', async () => {
+  await setup();
+  deliver({
+    'messages.upsert': {
+      messages: [albumContainer('M8'), textMessage('M9')],
+      type: 'notify',
+    },
+  });
+  await flush();
+
+  const upserts = emittedEvents
+    .filter((e) => e.event === 'messages.upsert')
+    .map((e) => e.data)
+    .flat();
+  assert.deepEqual(
+    upserts.map((payload) => [payload.key.id, payload.messageType]),
+    [
+      ['M8', 'albumMessage'],
+      ['M9', 'conversation'],
+    ],
+    String(errors),
+  );
+});
+
+test('multi-key album container survives a content-type resolution that yields no key (history path)', async () => {
+  await setup();
+  simulateMultiKeyContentTypeUndefined = true;
+  deliver(historyEvent([albumContainer('M10'), textMessage('M11')], 100));
+  await flush();
+
+  assert.equal(createManyCalls.length, 1, String(errors));
+  assert.deepEqual(
+    createManyCalls[0].data.map((record: any) => [record.key.id, record.messageType]),
+    [
+      ['M10', 'albumMessage'],
+      ['M11', 'conversation'],
+    ],
+  );
+  assert.equal(historySetEvents()[0].data.messageCount, 2);
+});
+
+test('multi-key album container survives a content-type resolution that yields no key (live path)', async () => {
+  await setup();
+  simulateMultiKeyContentTypeUndefined = true;
+  deliver({
+    'messages.upsert': {
+      messages: [albumContainer('M12'), textMessage('M13')],
+      type: 'notify',
+    },
+  });
+  await flush();
+
+  const upserts = emittedEvents
+    .filter((e) => e.event === 'messages.upsert')
+    .map((e) => e.data)
+    .flat();
+  assert.deepEqual(
+    upserts.map((payload) => [payload.key.id, payload.messageType]),
+    [
+      ['M12', 'albumMessage'],
+      ['M13', 'conversation'],
+    ],
+    String(errors),
+  );
 });
 
 test('replay of an already-persisted message is not re-imported', async () => {

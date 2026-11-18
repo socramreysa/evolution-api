@@ -159,6 +159,7 @@ import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { buildInteractiveBizNode, buildListBizNode, toNativeFlowButton } from './helpers/interactiveMessage.helper';
+import { ReceiveTrace } from './helpers/receiveTrace.helper';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -269,6 +270,11 @@ export class BaileysStartupService extends ChannelStartupService {
   private _reconnectTimer: NodeJS.Timeout | null = null;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  // Temporary receive trace: one object per service (window + budget survive
+  // reconnects) and a generation counter bumped on each socket creation. The
+  // generation is captured in registration closures, never stored on the SDK.
+  private readonly receiveTrace = new ReceiveTrace();
+  private receiveTraceGen = 0;
 
   // Cumulative history sync counters (reset on new sync or completion)
   private historySyncMessageCount = 0;
@@ -604,6 +610,7 @@ export class BaileysStartupService extends ChannelStartupService {
       }
       this.cancelReconnect();
       this._reconnectAttempts = 0;
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -836,6 +843,39 @@ export class BaileysStartupService extends ChannelStartupService {
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
+
+    // ── Temporary receive trace: bump generation, emit socket, optional WS ──
+    // The generation is captured in the registration closures (eventHandler /
+    // ws listener) so a stale callback reports its own generation. No fields
+    // are written onto the SDK client.
+    this.receiveTraceGen += 1;
+    const traceGen = this.receiveTraceGen;
+    const traceClient = this.client;
+    try {
+      this.receiveTrace.socket(this.instance.name, traceGen);
+      if (this.receiveTrace.enabled(this.instance.name)) {
+        // Read-only buffer-state probe bound to THIS captured client. The
+        // helper calls it lazily after its own gates; a missing/throwing/
+        // non-boolean SDK answer degrades to "unknown" (field omitted).
+        const readBuffering = (): unknown => (traceClient as any)?.ev?.isBuffering?.();
+        traceClient.ws.on('message', (buf: Buffer) => {
+          this.receiveTrace.ws(this.instance.name, buf?.byteLength ?? 0, traceGen, readBuffering);
+        });
+        // Decoded-node observer on the SAME captured client/generation: the
+        // callback extracts ONLY node.attrs.id (never the node, attrs,
+        // content or children) and everything runs inside its own try/catch.
+        traceClient.ws.on('CB:message', (node: unknown) => {
+          try {
+            const id = (node as any)?.attrs?.id;
+            this.receiveTrace.node(this.instance.name, traceGen, id, readBuffering);
+          } catch {
+            // observer failure never reaches the SDK event flow
+          }
+        });
+      }
+    } catch {
+      // trace failure never breaks connection
+    }
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -1238,7 +1278,7 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          if (!getContentType(m.message)) {
+          if (!this.resolveMessageType(m.message)) {
             if (this.isRecognizedControlEnvelope(m.message)) {
               skippedControls += 1;
             } else {
@@ -1273,7 +1313,16 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          const inserted = await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          // ── Temporary receive trace: history batch before/after (counts only) ──
+          this.receiveTrace.persistHistory(this.instance.name, 'before', messagesRaw.length);
+
+          const inserted = await this.prismaRepository.message.createMany({
+            data: messagesRaw,
+            skipDuplicates: true,
+          });
+
+          this.receiveTrace.persistHistory(this.instance.name, 'after', inserted.count);
+
           this.logger.info(`history sync: ${inserted.count} message(s) inserted in this batch`);
         }
 
@@ -1604,7 +1653,20 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw as any;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
+
+            // ── Temporary receive trace: persist_create before/after/failed ──
+            // On failure the SAME error is rethrown so outer handling is preserved.
+            this.receiveTrace.persistCreate(this.instance.name, 'before', received.key?.id);
+            const msg = await this.prismaRepository.message.create({ data: messageData }).then(
+              (created) => {
+                this.receiveTrace.persistCreate(this.instance.name, 'after', received.key?.id);
+                return created;
+              },
+              (error) => {
+                this.receiveTrace.persistCreate(this.instance.name, 'failed', received.key?.id);
+                throw error;
+              },
+            );
 
             const { remoteJid } = received.key;
             const timestamp = msg.messageTimestamp;
@@ -2167,8 +2229,28 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler() {
+    // Capture this socket's generation ONCE at registration so a stale
+    // callback reports its own generation — never the live this.client's.
+    const traceGen = this.receiveTraceGen;
     this.client.ev.process(async (events) => {
+      const instanceName = this.instance.name;
+      const upsert = events['messages.upsert'];
+      const batch = upsert ? this.receiveTrace.nextBatchId() : '';
+      let enqueuedAt = 0;
+
+      // ── Temporary receive trace: batch observed BEFORE the FIFO enqueue ──
+      if (upsert) {
+        const msgs = Array.isArray(upsert.messages) ? upsert.messages : [];
+        const ids = msgs.map((m: any) => m?.key?.id);
+        this.receiveTrace.observe(instanceName, batch, ids, traceGen);
+        enqueuedAt = performance.now();
+      }
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
+        const startedAt = performance.now();
+        if (upsert) {
+          this.receiveTrace.queueEnter(instanceName, batch, traceGen);
+        }
         try {
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
@@ -2301,6 +2383,11 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         } catch (error) {
           this.logger.error(error);
+        } finally {
+          if (batch) {
+            const exitedAt = performance.now();
+            this.receiveTrace.queueExit(instanceName, batch, traceGen, startedAt - enqueuedAt, exitedAt - startedAt);
+          }
         }
       });
     });
@@ -5280,6 +5367,32 @@ export class BaileysStartupService extends ChannelStartupService {
     return keys.every((key) => key === 'senderKeyDistributionMessage');
   }
 
+  /**
+   * Resolves the content type key that names a message envelope.
+   *
+   * The pinned Baileys `getContentType` only reports a key that is `conversation`
+   * or contains `Message` (excluding `senderKeyDistributionMessage`), so a build
+   * or protocol shape that yields no key for a multi-key envelope leaves
+   * `messageType` undefined. Album containers are multi-key envelopes
+   * (`albumMessage` alongside `messageContextInfo`) and must be named by their own
+   * key: an undefined `messageType` is a required Prisma field, so the album
+   * placeholder row is lost on both the live upsert and the history path. The
+   * fallback only names the envelope by the key it actually carries; genuinely
+   * unknown content still resolves to undefined and stays skipped.
+   */
+  private resolveMessageType(content: unknown): string | undefined {
+    if (!content || typeof content !== 'object') {
+      return undefined;
+    }
+
+    const messageType = getContentType(content as proto.IMessage);
+    if (messageType) {
+      return messageType;
+    }
+
+    return (content as proto.IMessage).albumMessage ? 'albumMessage' : undefined;
+  }
+
   private prepareMessage(message: WAMessage): Message {
     const keyAny = message.key as any;
     const messageRaw: any = {
@@ -5294,7 +5407,7 @@ export class BaileysStartupService extends ChannelStartupService {
           ? 'Você'
           : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
       message: this.deserializeMessageBuffers({ ...message.message }),
-      messageType: getContentType(message.message),
+      messageType: this.resolveMessageType(message.message),
       messageTimestamp: Long.isLong(message.messageTimestamp)
         ? message.messageTimestamp.toNumber()
         : (message.messageTimestamp as number),
