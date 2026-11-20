@@ -93,9 +93,19 @@ const getContentTypeUnderTest = (content: any) =>
   simulateMultiKeyContentTypeUndefined && content && typeof content === 'object' && Object.keys(content).length > 1
     ? undefined
     : getRealContentType(content);
+const matchHistoryCalls: { count: number; anchorKey: any; timestampMs: number }[] = [];
+let failNextHistoryFetch = false;
 const makeSocket = () => ({
   user: { id: '15551234567@s.whatsapp.net', name: 'Offline' },
   profilePictureUrl: async () => null,
+  fetchMessageHistory: async (count: number, anchorKey: any, timestampMs: number) => {
+    if (failNextHistoryFetch) {
+      failNextHistoryFetch = false;
+      throw new Error('Synthetic history request failure');
+    }
+    matchHistoryCalls.push({ count, anchorKey, timestampMs });
+    return `req-${matchHistoryCalls.length}`;
+  },
   ev: {
     process: (callback: (events: object) => void) => {
       deliver = callback;
@@ -139,7 +149,12 @@ let failNextCreateMany = false;
 // caused whole-batch loss of valid historical messages.
 const createManyKeyIds = new Set<string>();
 
-async function setup(options: { existingMessageIds?: string[] } = {}) {
+async function setup(
+  options: {
+    existingMessageIds?: string[];
+    latestMessage?: { key: any; messageTimestamp: number } | null;
+  } = {},
+) {
   errors.length = 0;
   warns.length = 0;
   infos.length = 0;
@@ -148,6 +163,8 @@ async function setup(options: { existingMessageIds?: string[] } = {}) {
   createManyKeyIds.clear();
   failNextCreateMany = false;
   simulateMultiKeyContentTypeUndefined = false;
+  matchHistoryCalls.length = 0;
+  failNextHistoryFetch = false;
 
   const instanceName = `offline-history-${Math.random().toString(36).slice(2)}`;
   const instanceId = `${instanceName}-id`;
@@ -166,6 +183,7 @@ async function setup(options: { existingMessageIds?: string[] } = {}) {
       createMany: async () => ({ count: 0 }),
     },
     message: {
+      findFirst: async () => options.latestMessage ?? null,
       findMany: async () => (options.existingMessageIds ?? []).map((id) => ({ key: { id } })),
       createMany: async ({ data }: { data: any[] }) => {
         if (failNextCreateMany) {
@@ -453,4 +471,105 @@ test('replay of an already-persisted message is not re-imported', async () => {
   assert.equal(createManyCalls.length, 1, String(errors));
   assert.equal(createManyCalls[0].data.length, 0);
   assert.equal(historySetEvents()[0].data.messageCount, 0);
+});
+
+// ── Stream-error reconnect → automatic on-demand history sync ────────────────
+// A 500/503 stream error drops the socket; on reconnect WhatsApp does not redeliver
+// what was sent during the blind window, so the service must ask for history
+// anchored on the newest stored message instead of waiting for an admin request.
+const anchorMessage = () => ({ key: { id: 'M1', remoteJid: jid, fromMe: false }, messageTimestamp: 1700000000 });
+const connectionEvent = (connection: 'close' | 'open', statusCode?: number) => ({
+  'connection.update': {
+    connection,
+    ...(statusCode === undefined ? {} : { lastDisconnect: { error: { output: { statusCode } } } }),
+  },
+});
+
+test('stream-error close (503) followed by open requests history anchored on the newest stored message', async () => {
+  await setup({ latestMessage: anchorMessage() });
+
+  deliver(connectionEvent('close', 503));
+  await flush();
+  assert.equal(matchHistoryCalls.length, 0, 'history must not be requested while disconnected');
+
+  deliver(connectionEvent('open'));
+  await flush();
+
+  assert.equal(matchHistoryCalls.length, 1, String(errors));
+  assert.deepEqual(matchHistoryCalls[0].anchorKey, { id: 'M1', remoteJid: jid, fromMe: false });
+  assert.equal(matchHistoryCalls[0].count, 50);
+  // Stored timestamps are seconds; baileys expects milliseconds.
+  assert.equal(matchHistoryCalls[0].timestampMs, 1700000000000);
+  assert.ok(
+    infos.some((line) => line.includes('Post-stream-error history sync accepted requestId=req-1')),
+    String(infos),
+  );
+});
+
+test('stream-error close (500) consumes the armed flag exactly once across reopens', async () => {
+  await setup({ latestMessage: anchorMessage() });
+
+  deliver(connectionEvent('close', 500));
+  await flush();
+  deliver(connectionEvent('open'));
+  await flush();
+
+  assert.equal(matchHistoryCalls.length, 1, String(errors));
+
+  // Epilogue: a later open without a stream-error close must not request history again.
+  deliver(connectionEvent('open'));
+  await flush();
+
+  assert.equal(matchHistoryCalls.length, 1, String(errors));
+});
+
+test('non-stream-error close (200) followed by open requests no history', async () => {
+  await setup({ latestMessage: anchorMessage() });
+
+  deliver(connectionEvent('close', 200));
+  await flush();
+  deliver(connectionEvent('open'));
+  await flush();
+
+  assert.equal(matchHistoryCalls.length, 0, String(errors));
+  assert.equal(createManyCalls.length, 0, String(errors));
+});
+
+test('stream-error close with no stored message requests nothing and still completes the open flow', async () => {
+  await setup({ latestMessage: null });
+
+  deliver(connectionEvent('close', 503));
+  await flush();
+  deliver(connectionEvent('open'));
+  await flush();
+
+  assert.equal(matchHistoryCalls.length, 0, String(errors));
+  assert.ok(
+    infos.some((line) => line.includes('CONNECTED TO WHATSAPP')),
+    `open flow must still complete without a history anchor: ${String(infos.slice(-5))}`,
+  );
+  assert.equal(errors.length, 0, String(errors));
+});
+
+test('a rejected history request is logged without payload and never breaks the open flow', async () => {
+  await setup({ latestMessage: anchorMessage() });
+  failNextHistoryFetch = true;
+
+  deliver(connectionEvent('close', 503));
+  await flush();
+  deliver(connectionEvent('open'));
+  await flush();
+
+  assert.ok(
+    errors.some((entry) => String(entry).includes('Post-stream-error history sync failed')),
+    String(errors),
+  );
+  assert.ok(
+    !errors.some((entry) => String(entry).includes('Synthetic history request failure')),
+    `the failure log must not leak the thrown payload: ${String(errors)}`,
+  );
+  assert.ok(
+    infos.some((line) => line.includes('CONNECTED TO WHATSAPP')),
+    String(infos.slice(-5)),
+  );
 });

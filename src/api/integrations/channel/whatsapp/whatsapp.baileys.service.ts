@@ -268,6 +268,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private _reconnectAttempts = 0;
   private _reconnectScheduled = false;
   private _reconnectTimer: NodeJS.Timeout | null = null;
+  // Armed when a stream error (500/503) closes the socket, consumed on the next
+  // successful open so exactly one on-demand history sync fills the blind window.
+  private _streamErrorDisconnect = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   // Temporary receive trace: one object per service (window + budget survive
@@ -530,6 +533,12 @@ export class BaileysStartupService extends ChannelStartupService {
         return;
       }
 
+      // 500/503 are the stream errors we observe in production: the socket drops
+      // and WhatsApp does not redeliver what was sent during the blind window.
+      if (statusCode === 500 || statusCode === 503) {
+        this._streamErrorDisconnect = true;
+      }
+
       // Preserve this base's terminal/515 behavior; do not import the newer stream-515 grace policy.
       const isTerminal = codesToNotReconnect.includes(statusCode);
       const attemptsExhausted = this._reconnectAttempts >= BaileysStartupService.RECONNECT_MAX_ATTEMPTS;
@@ -611,6 +620,11 @@ export class BaileysStartupService extends ChannelStartupService {
       this.cancelReconnect();
       this._reconnectAttempts = 0;
 
+      if (this._streamErrorDisconnect) {
+        this._streamErrorDisconnect = false;
+        await this.requestHistoryAfterStreamError();
+      }
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -663,6 +677,39 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
+    }
+  }
+
+  /**
+   * Fills the blind window left by a stream-error disconnect. Reconnecting does not
+   * replay what WhatsApp considers already delivered, so we ask for an on-demand
+   * history sync anchored on the most recent stored message of this instance.
+   */
+  private async requestHistoryAfterStreamError() {
+    try {
+      const lastMessage = await this.prismaRepository.message.findFirst({
+        where: { instanceId: this.instanceId },
+        orderBy: { messageTimestamp: 'desc' },
+        take: 1,
+        select: { key: true, messageTimestamp: true },
+      });
+
+      if (!lastMessage) {
+        return;
+      }
+
+      const anchorKey = lastMessage.key as { id: string; remoteJid: string; fromMe: boolean };
+      const requestId = await this.client.fetchMessageHistory(
+        50,
+        anchorKey,
+        // messageTimestamp is stored in seconds but baileys expects milliseconds:
+        // messages-recv.js writes oldestMsgTimestampMs unchanged (baileys #2452 / PR #2616).
+        lastMessage.messageTimestamp * 1000,
+      );
+
+      this.logger.info(`Post-stream-error history sync accepted requestId=${requestId}`);
+    } catch {
+      this.logger.error('Post-stream-error history sync failed');
     }
   }
 
