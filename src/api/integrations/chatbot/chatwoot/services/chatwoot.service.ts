@@ -33,6 +33,11 @@ import mimeTypes from 'mime-types';
 import path from 'path';
 import { Readable } from 'stream';
 
+// A WhatsApp message older than this is not a live delivery: it was recovered by a
+// reconnect/history sync. Forwarding its original timestamp lets Chatwoot (BESEL)
+// place it chronologically instead of at the moment Evolution finally delivers it.
+const EXTERNAL_CREATED_AT_MIN_AGE_SECONDS = 300;
+
 interface ChatwootMessage {
   messageId?: number;
   inboxId?: number;
@@ -1032,6 +1037,12 @@ export class ChatwootService {
       messageData.source_reply_id = sourceReplyId.toString();
     }
 
+    const externalCreatedAt = this.buildExternalCreatedAt(messageBody);
+
+    if (externalCreatedAt) {
+      messageData.external_created_at = externalCreatedAt;
+    }
+
     const message = await client.messages.create({
       accountId: this.provider.accountId,
       conversationId: conversationId,
@@ -1176,6 +1187,12 @@ export class ChatwootService {
 
     if (sourceId) {
       data.append('source_id', sourceId);
+    }
+
+    const externalCreatedAt = this.buildExternalCreatedAt(messageBody);
+
+    if (externalCreatedAt) {
+      data.append('external_created_at', externalCreatedAt);
     }
 
     const config = {
@@ -1762,6 +1779,33 @@ export class ChatwootService {
     }
 
     return messages[0] || null;
+  }
+
+  /**
+   * Returns the ISO8601 UTC creation time of a recovered message, or undefined when
+   * the message is recent (live) or carries no usable timestamp. Chatwoot only gets
+   * `external_created_at` for messages that arrived well after their original time.
+   */
+  private buildExternalCreatedAt(messageBody?: any): string | undefined {
+    const rawTimestamp = messageBody?.messageTimestamp;
+
+    if (rawTimestamp === undefined || rawTimestamp === null) {
+      return undefined;
+    }
+
+    const timestampSeconds = Long.isLong(rawTimestamp) ? rawTimestamp.toNumber() : Number(rawTimestamp);
+
+    if (!Number.isFinite(timestampSeconds) || timestampSeconds <= 0) {
+      return undefined;
+    }
+
+    const ageMs = Date.now() - timestampSeconds * 1000;
+
+    if (ageMs <= EXTERNAL_CREATED_AT_MIN_AGE_SECONDS * 1000) {
+      return undefined;
+    }
+
+    return new Date(timestampSeconds * 1000).toISOString();
   }
 
   private async getReplyToIds(
